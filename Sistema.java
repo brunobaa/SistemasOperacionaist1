@@ -73,101 +73,105 @@ public class Sistema {
 		SYSCALL, STOP                  // chamada de sistema e parada
 	}
 
-	public enum Interrupts {           // possiveis interrupcoes que esta CPU gera
-		noInterrupt, intEnderecoInvalido, intInstrucaoInvalida, intOverflow;
+	public enum Interrupts {
+		noInterrupt,
+		intEnderecoInvalido,
+		intInstrucaoInvalida,
+		intOverflow,
+		intClock   // <-- NECESSÁRIO PARA O runSlice()
 	}
+	
 
 	public class CPU {
 		private int maxInt; // valores maximo e minimo para inteiros nesta cpu
 		private int minInt;
-		                    // CONTEXTO da CPU ...
-		private int pc;     // ... composto de program counter,
-		private Word ir;    // instruction register,
-		private int[] reg;  // registradores da CPU
-		private Interrupts irpt; // durante instrucao, interrupcao pode ser sinalizada
-		                    // FIM CONTEXTO DA CPU: tudo que precisa sobre o estado de um processo para
-		                    // executa-lo
-		                    // nas proximas versoes isto pode modificar
+	
+		// CONTEXTO da CPU
+		private int pc;         // program counter
+		private Word ir;        // instruction register
+		private int[] reg;      // registradores da CPU
+		private Interrupts irpt; // interrupcao sinalizada durante execucao
+	
+		private Word[] m;       // memoria fisica
+	
+		private InterruptHandling ih;    // rotinas de tratamento de int
+		private SysCallHandling sysCall; // rotinas de tratamento de syscall
+	
+		private boolean cpuStop; // parar CPU (stop ou erro)
+		private boolean debug;   // trace
+		private Utilities u;     // dump
+	
+		private PCB pcb;         // processo atual (para tradução MMU)
+		private MMU mmu;         // mmu para traduzir endereços
+		private int tamPg;       // opcional, cache
+	
+		// controle de fatia (parte C)
+		private int instrCountPerSlice = 0;
 
-		private Word[] m;   // m é o array de memória "física", CPU tem uma ref a m para acessar
-
-		private InterruptHandling ih;    // significa desvio para rotinas de tratamento de Int - se int ligada, desvia
-		private SysCallHandling sysCall; // significa desvio para tratamento de chamadas de sistema
-
-		private boolean cpuStop;    // flag para parar CPU - caso de interrupcao que acaba o processo, ou chamada stop - 
-									// nesta versao acaba o sistema no fim do prog
-
-		                            // auxilio aa depuração
-		private boolean debug;      // se true entao mostra cada instrucao em execucao
-		private Utilities u;        // para debug (dump)
-
-		private PCB pcb;      // processo atual (para tradução)
-		private MMU mmu;      // mmu para traduzir endereços
-		private int tamPg;    // opcional, só cache
-
-		public CPU(Memory _mem, boolean _debug) { // ref a MEMORIA passada na criacao da CPU
-			maxInt = 32767;            // capacidade de representacao modelada
-			minInt = -32767;           // se exceder deve gerar interrupcao de overflow
-			m = _mem.pos;              // usa o atributo 'm' para acessar a memoria, só para ficar mais pratico
-			reg = new int[10];         // aloca o espaço dos registradores - regs 8 e 9 usados somente para IO
-
-			debug = _debug;            // se true, print da instrucao em execucao
-
+		public int getPc() { return pc; }
+		public int[] getRegs() { return reg; }
+	
+		public CPU(Memory _mem, boolean _debug) {
+			maxInt = 32767;
+			minInt = -32767;
+			m = _mem.pos;
+			reg = new int[10];   // regs 8 e 9 usados apenas p/ IO
+			debug = _debug;
 		}
-
-		
-
+	
 		public void setAddressOfHandlers(InterruptHandling _ih, SysCallHandling _sysCall) {
-			ih = _ih;                  // aponta para rotinas de tratamento de int
-			sysCall = _sysCall;        // aponta para rotinas de tratamento de chamadas de sistema
+			ih = _ih;
+			sysCall = _sysCall;
 		}
-
-		public void setUtilities(Utilities _u) {
-			u = _u;                     // aponta para rotinas utilitárias - fazer dump da memória na tela
-		}
-
-
-                                       // verificação de enderecamento 
-		private boolean legal(int e) { // todo acesso a memoria tem que ser verificado se é válido - 
-			                           // aqui no caso se o endereco é um endereco valido em toda memoria
-			if (e >= 0 && e < m.length) {
-				return true;
-			} else {
-				irpt = Interrupts.intEnderecoInvalido;    // se nao for liga interrupcao no meio da exec da instrucao
-				return false;
-			}
-		}
-
-		private boolean testOverflow(int v) {             // toda operacao matematica deve avaliar se ocorre overflow
-			if ((v < minInt) || (v > maxInt)) {
-				irpt = Interrupts.intOverflow;            // se houver liga interrupcao no meio da exec da instrucao
-				return false;
-			}
-			;
-			return true;
-		}
-
-		// Na CPU:
-		public void setMMU(MMU _mmu, int _tamPg) {
-			this.mmu = _mmu;
-			this.tamPg = _tamPg;
-		}
-		// SUBSTITUA o setContext antigo por este:
+	
+		public void setUtilities(Utilities _u) { u = _u; }
+	
+		public void setMMU(MMU _mmu, int _tamPg) { this.mmu = _mmu; this.tamPg = _tamPg; }
+	
+		// (modo compatível com as partes A/B)
 		public void setContext(int _pc, PCB _pcb) {
 			pc = _pc;
 			pcb = _pcb;
 			irpt = Interrupts.noInterrupt;
+			// zera regs para execucao "inteira" (sem preempcao)
+			for (int i = 0; i < 10; i++) reg[i] = 0;
 		}
-		
-
+	
 		public void setDebug(boolean on) { this.debug = on; }
-
+	
+		// ------------------ helpers de contexto (parte C) ------------------
+		private void loadContextFromPCB(PCB p) {
+			this.pc = p.pc;
+			for (int i = 0; i < 10; i++) this.reg[i] = p.regs[i];
+			this.irpt = Interrupts.noInterrupt;
+		}
+		private void saveContextToPCB(PCB p) {
+			p.pc = this.pc;
+			for (int i = 0; i < 10; i++) p.regs[i] = this.reg[i];
+		}
+	
+		// ------------------ validacoes basicas ------------------
+		private boolean legal(int e) { // (aqui seria end. fisico; com MMU quase nao usamos)
+			if (e >= 0 && e < m.length) return true;
+			irpt = Interrupts.intEnderecoInvalido;
+			return false;
+		}
+	
+		private boolean testOverflow(int v) {
+			if ((v < minInt) || (v > maxInt)) {
+				irpt = Interrupts.intOverflow;
+				return false;
+			}
+			return true;
+		}
+	
+		// ================== run() (compatibilidade: executa ate STOP/erro) ==================
 		public void run() {
 			cpuStop = false;
 			while (!cpuStop) {
-				// ------------------ FASE DE FETCH ------------------
+				// FETCH
 				try {
-					ir = mmu.read(pcb, pc);        // PC é LÓGICO -> MMU traduz e lê a Word
+					ir = mmu.read(pcb, pc); // PC logico -> MMU traduz
 					if (debug) {
 						System.out.print("                                              regs: ");
 						for (int i = 0; i < 10; i++) System.out.print(" r[" + i + "]:" + reg[i]);
@@ -179,31 +183,23 @@ public class Sistema {
 					irpt = Interrupts.intEnderecoInvalido;
 				}
 	
-				// ------------------ FASE DE EXECUÇÃO ----------------
+				// EXEC
 				if (irpt == Interrupts.noInterrupt) {
 					switch (ir.opc) {
-	
 						// --- MOVIMENTAÇÃO / MEMÓRIA ---
-						case LDI: // Rd <- k
-							reg[ir.ra] = ir.p;
-							pc++;
+						case LDI: reg[ir.ra] = ir.p; pc++; break;
+	
+						case LDD: // Rd <- [A] (A logico)
+							try { reg[ir.ra] = mmu.read(pcb, ir.p).p; pc++; }
+							catch (Exception e) { irpt = Interrupts.intEnderecoInvalido; }
 							break;
 	
-						case LDD: // Rd <- [A] (A lógico)
-							try {
-								reg[ir.ra] = mmu.read(pcb, ir.p).p;
-								pc++;
-							} catch (Exception e) { irpt = Interrupts.intEnderecoInvalido; }
+						case LDX: // RD <- [RS] (end logico em reg[rb])
+							try { reg[ir.ra] = mmu.read(pcb, reg[ir.rb]).p; pc++; }
+							catch (Exception e) { irpt = Interrupts.intEnderecoInvalido; }
 							break;
 	
-						case LDX: // RD <- [RS]  (end lógico em reg[rb])
-							try {
-								reg[ir.ra] = mmu.read(pcb, reg[ir.rb]).p;
-								pc++;
-							} catch (Exception e) { irpt = Interrupts.intEnderecoInvalido; }
-							break;
-	
-						case STD: // [A] <- Rs   (A lógico)
+						case STD: // [A] <- Rs (A logico)
 							try {
 								mmu.writeData(pcb, ir.p, reg[ir.ra]);
 								pc++;
@@ -211,116 +207,62 @@ public class Sistema {
 							} catch (Exception e) { irpt = Interrupts.intEnderecoInvalido; }
 							break;
 	
-						case STX: // [Rd] <- Rs  (end lógico em reg[ra])
-							try {
-								mmu.writeData(pcb, reg[ir.ra], reg[ir.rb]);
-								pc++;
-							} catch (Exception e) { irpt = Interrupts.intEnderecoInvalido; }
+						case STX: // [Rd] <- Rs (end logico em reg[ra])
+							try { mmu.writeData(pcb, reg[ir.ra], reg[ir.rb]); pc++; }
+							catch (Exception e) { irpt = Interrupts.intEnderecoInvalido; }
 							break;
 	
-						case MOVE: // RD <- RS
-							reg[ir.ra] = reg[ir.rb];
-							pc++;
-							break;
+						case MOVE: reg[ir.ra] = reg[ir.rb]; pc++; break;
 	
 						// --- ARITMÉTICAS ---
-						case ADD: // Rd <- Rd + Rs
-							reg[ir.ra] = reg[ir.ra] + reg[ir.rb];
-							testOverflow(reg[ir.ra]);
-							pc++;
-							break;
-	
-						case ADDI: // Rd <- Rd + k
-							reg[ir.ra] = reg[ir.ra] + ir.p;
-							testOverflow(reg[ir.ra]);
-							pc++;
-							break;
-	
-						case SUB: // Rd <- Rd - Rs
-							reg[ir.ra] = reg[ir.ra] - reg[ir.rb];
-							testOverflow(reg[ir.ra]);
-							pc++;
-							break;
-	
-						case SUBI: // Rd <- Rd - k
-							reg[ir.ra] = reg[ir.ra] - ir.p;
-							testOverflow(reg[ir.ra]);
-							pc++;
-							break;
-	
-						case MULT: // Rd <- Rd * Rs
-							reg[ir.ra] = reg[ir.ra] * reg[ir.rb];
-							testOverflow(reg[ir.ra]);
-							pc++;
-							break;
+						case ADD:  reg[ir.ra] = reg[ir.ra] + reg[ir.rb]; testOverflow(reg[ir.ra]); pc++; break;
+						case ADDI: reg[ir.ra] = reg[ir.ra] + ir.p;        testOverflow(reg[ir.ra]); pc++; break;
+						case SUB:  reg[ir.ra] = reg[ir.ra] - reg[ir.rb]; testOverflow(reg[ir.ra]); pc++; break;
+						case SUBI: reg[ir.ra] = reg[ir.ra] - ir.p;        testOverflow(reg[ir.ra]); pc++; break;
+						case MULT: reg[ir.ra] = reg[ir.ra] * reg[ir.rb]; testOverflow(reg[ir.ra]); pc++; break;
 	
 						// --- DESVIOS ---
-						case JMP: // PC <- k
-							pc = ir.p;
-							break;
+						case JMP:    pc = ir.p; break;
 	
-						case JMPIM: // PC <- [A]   (A lógico -> lê Word e usa .p como novo PC lógico)
+						case JMPI:   pc = reg[ir.ra]; break;
+	
+						case JMPIM:  // PC <- [A]
 							try { pc = mmu.read(pcb, ir.p).p; }
 							catch (Exception e) { irpt = Interrupts.intEnderecoInvalido; }
 							break;
 	
-						case JMPIG: // if Rc>0 PC<-Rs else PC++
-							if (reg[ir.rb] > 0) pc = reg[ir.ra]; else pc++;
+						case JMPIG:  if (reg[ir.rb] > 0) pc = reg[ir.ra]; else pc++; break;
+						case JMPIL:  if (reg[ir.rb] < 0) pc = reg[ir.ra]; else pc++; break;
+						case JMPIE:  if (reg[ir.rb] == 0) pc = reg[ir.ra]; else pc++; break;
+	
+						case JMPIGK: if (reg[ir.rb] > 0) pc = ir.p; else pc++; break;
+						case JMPILK: if (reg[ir.rb] < 0) pc = ir.p; else pc++; break;
+						case JMPIEK: if (reg[ir.rb] == 0) pc = ir.p; else pc++; break;
+						case JMPIGT: if (reg[ir.ra] > reg[ir.rb]) pc = ir.p; else pc++; break;
+	
+						case JMPIGM:
+							try { if (reg[ir.rb] > 0) pc = mmu.read(pcb, ir.p).p; else pc++; }
+							catch (Exception e) { irpt = Interrupts.intEnderecoInvalido; }
 							break;
 	
-						case JMPIGK: // if Rc>0 PC<-k else PC++
-							if (reg[ir.rb] > 0) pc = ir.p; else pc++;
+						case JMPILM:
+							try { if (reg[ir.rb] < 0) pc = mmu.read(pcb, ir.p).p; else pc++; }
+							catch (Exception e) { irpt = Interrupts.intEnderecoInvalido; }
 							break;
 	
-						case JMPILK: // if Rc<0 PC<-k else PC++
-							if (reg[ir.rb] < 0) pc = ir.p; else pc++;
+						case JMPIEM:
+							try { if (reg[ir.rb] == 0) pc = mmu.read(pcb, ir.p).p; else pc++; }
+							catch (Exception e) { irpt = Interrupts.intEnderecoInvalido; }
 							break;
 	
-						case JMPIEK: // if Rc=0 PC<-k else PC++
-							if (reg[ir.rb] == 0) pc = ir.p; else pc++;
-							break;
-	
-						case JMPIL: // if Rc<0 PC<-Rs else PC++
-							if (reg[ir.rb] < 0) pc = reg[ir.ra]; else pc++;
-							break;
-	
-						case JMPIE: // if Rc=0 PC<-Rs else PC++
-							if (reg[ir.rb] == 0) pc = reg[ir.ra]; else pc++;
-							break;
-	
-						case JMPIGM: // if Rc>0 PC <- [A] else PC++
-							try {
-								if (reg[ir.rb] > 0) pc = mmu.read(pcb, ir.p).p;
-								else pc++;
-							} catch (Exception e) { irpt = Interrupts.intEnderecoInvalido; }
-							break;
-	
-						case JMPILM: // if Rc<0 PC <- [A] else PC++
-							try {
-								if (reg[ir.rb] < 0) pc = mmu.read(pcb, ir.p).p;
-								else pc++;
-							} catch (Exception e) { irpt = Interrupts.intEnderecoInvalido; }
-							break;
-	
-						case JMPIEM: // if Rc=0 PC <- [A] else PC++
-							try {
-								if (reg[ir.rb] == 0) pc = mmu.read(pcb, ir.p).p;
-								else pc++;
-							} catch (Exception e) { irpt = Interrupts.intEnderecoInvalido; }
-							break;
-	
-						case JMPIGT: // if Rs>Rc PC<-k else PC++
-							if (reg[ir.ra] > reg[ir.rb]) pc = ir.p; else pc++;
-							break;
-	
-						// --- DADO onde não deveria haver instrução ---
+						// --- DADOS ONDE NÃO DEVERIA HAVER INSTRUÇÃO ---
 						case DATA:
 							irpt = Interrupts.intInstrucaoInvalida;
 							break;
 	
 						// --- SYSCALL / STOP ---
 						case SYSCALL:
-							sysCall.handle(); 
+							sysCall.handle();
 							pc++;
 							break;
 	
@@ -335,14 +277,154 @@ public class Sistema {
 					}
 				}
 	
-				// ------------------ FASE DE VERIFICAÇÃO DE INTERRUPÇÃO ----------------
+				// VERIFICA INTERRUPÇÃO
 				if (irpt != Interrupts.noInterrupt) {
 					ih.handle(irpt);
 					cpuStop = true;
 				}
-			} // fim do while
+			}
+		}
+	
+		// ================== runSlice(delta) (parte C: preempcao por tempo) ==================
+		// Executa no maximo 'delta' instrucoes para o PCB 'p'.
+		// Retorna a causa (intClock, overflow, endereco invalido, etc.) ou noInterrupt se parou por STOP.
+		public Interrupts runSlice(int delta, PCB p) {
+			this.pcb = p;
+			instrCountPerSlice = 0;
+			cpuStop = false;
+	
+			loadContextFromPCB(p); // restaura contexto salvo
+	
+			while (!cpuStop) {
+				// FETCH
+				try {
+					ir = mmu.read(pcb, pc); // PC logico -> MMU traduz
+					if (debug) {
+						System.out.print("                                              regs: ");
+						for (int i = 0; i < 10; i++) System.out.print(" r[" + i + "]:" + reg[i]);
+						System.out.println();
+						System.out.print("                      pc: " + pc + "       exec: ");
+						u.dump(ir);
+					}
+				} catch (Exception e) {
+					irpt = Interrupts.intEnderecoInvalido;
+				}
+	
+				// EXEC
+				if (irpt == Interrupts.noInterrupt) {
+					switch (ir.opc) {
+						// --- MOVIMENTAÇÃO / MEMÓRIA ---
+						case LDI: reg[ir.ra] = ir.p; pc++; break;
+	
+						case LDD:
+							try { reg[ir.ra] = mmu.read(pcb, ir.p).p; pc++; }
+							catch (Exception e) { irpt = Interrupts.intEnderecoInvalido; }
+							break;
+	
+						case LDX:
+							try { reg[ir.ra] = mmu.read(pcb, reg[ir.rb]).p; pc++; }
+							catch (Exception e) { irpt = Interrupts.intEnderecoInvalido; }
+							break;
+	
+						case STD:
+							try {
+								mmu.writeData(pcb, ir.p, reg[ir.ra]);
+								pc++;
+								if (debug) { System.out.print("                                  "); u.dump(ir.p, ir.p+1); }
+							} catch (Exception e) { irpt = Interrupts.intEnderecoInvalido; }
+							break;
+	
+						case STX:
+							try { mmu.writeData(pcb, reg[ir.ra], reg[ir.rb]); pc++; }
+							catch (Exception e) { irpt = Interrupts.intEnderecoInvalido; }
+							break;
+	
+						case MOVE: reg[ir.ra] = reg[ir.rb]; pc++; break;
+	
+						// --- ARITMÉTICAS ---
+						case ADD:  reg[ir.ra] = reg[ir.ra] + reg[ir.rb]; testOverflow(reg[ir.ra]); pc++; break;
+						case ADDI: reg[ir.ra] = reg[ir.ra] + ir.p;        testOverflow(reg[ir.ra]); pc++; break;
+						case SUB:  reg[ir.ra] = reg[ir.ra] - reg[ir.rb]; testOverflow(reg[ir.ra]); pc++; break;
+						case SUBI: reg[ir.ra] = reg[ir.ra] - ir.p;        testOverflow(reg[ir.ra]); pc++; break;
+						case MULT: reg[ir.ra] = reg[ir.ra] * reg[ir.rb]; testOverflow(reg[ir.ra]); pc++; break;
+	
+						// --- DESVIOS ---
+						case JMP:    pc = ir.p; break;
+	
+						case JMPI:   pc = reg[ir.ra]; break;
+	
+						case JMPIM:
+							try { pc = mmu.read(pcb, ir.p).p; }
+							catch (Exception e) { irpt = Interrupts.intEnderecoInvalido; }
+							break;
+	
+						case JMPIG:  if (reg[ir.rb] > 0) pc = reg[ir.ra]; else pc++; break;
+						case JMPIL:  if (reg[ir.rb] < 0) pc = reg[ir.ra]; else pc++; break;
+						case JMPIE:  if (reg[ir.rb] == 0) pc = reg[ir.ra]; else pc++; break;
+	
+						case JMPIGK: if (reg[ir.rb] > 0) pc = ir.p; else pc++; break;
+						case JMPILK: if (reg[ir.rb] < 0) pc = ir.p; else pc++; break;
+						case JMPIEK: if (reg[ir.rb] == 0) pc = ir.p; else pc++; break;
+						case JMPIGT: if (reg[ir.ra] > reg[ir.rb]) pc = ir.p; else pc++; break;
+	
+						case JMPIGM:
+							try { if (reg[ir.rb] > 0) pc = mmu.read(pcb, ir.p).p; else pc++; }
+							catch (Exception e) { irpt = Interrupts.intEnderecoInvalido; }
+							break;
+	
+						case JMPILM:
+							try { if (reg[ir.rb] < 0) pc = mmu.read(pcb, ir.p).p; else pc++; }
+							catch (Exception e) { irpt = Interrupts.intEnderecoInvalido; }
+							break;
+	
+						case JMPIEM:
+							try { if (reg[ir.rb] == 0) pc = mmu.read(pcb, ir.p).p; else pc++; }
+							catch (Exception e) { irpt = Interrupts.intEnderecoInvalido; }
+							break;
+	
+						// --- DADOS ONDE NÃO DEVERIA HAVER INSTRUÇÃO ---
+						case DATA:
+							irpt = Interrupts.intInstrucaoInvalida;
+							break;
+	
+						// --- SYSCALL / STOP ---
+						case SYSCALL:
+							sysCall.handle();
+							pc++;
+							break;
+	
+						case STOP:
+							sysCall.stop();   // marca TERMINATED no PCB (feito no SysCallHandling)
+							cpuStop = true;   // encerra esta fatia (processo terminou)
+							break;
+	
+						default:
+							irpt = Interrupts.intInstrucaoInvalida;
+							break;
+					}
+				}
+	
+				// contou uma instrução desta fatia?
+				instrCountPerSlice++;
+	
+				// Se houve interrupção (erro), encerra a fatia:
+				if (irpt != Interrupts.noInterrupt) break;
+	
+				// Se atingiu o tempo e não terminou por STOP, gera intClock:
+				if (!cpuStop && instrCountPerSlice >= delta) {
+					irpt = Interrupts.intClock;
+					break;
+				}
+			}
+	
+			// salva contexto antes de sair
+			saveContextToPCB(p);
+	
+			// Nao chama ih.handle() aqui; quem chamou runSlice decide o que fazer
+			return irpt;
 		}
 	}
+	
 	// ------------------ C P U - fim
 	// -----------------------------------------------------------------------
 	// ------------------------------------------------------------------------------------------------------
@@ -382,8 +464,7 @@ public class Sistema {
 
 		public void handle(Interrupts irpt) {
 			// apenas avisa - todas interrupcoes neste momento finalizam o programa
-			System.out.println(
-					"                                               Interrupcao " + irpt + "   pc: " + hw.cpu.pc);
+			System.out.println("                                               Interrupcao " + irpt + "   pc: " + hw.cpu.getPc());
 		}
 	}
 
@@ -396,28 +477,33 @@ public class Sistema {
 			hw = _hw;
 		}
 
-		public void stop() { // chamada de sistema indicando final de programa
-							 // nesta versao cpu simplesmente pára
+		public void stop() {
 			System.out.println("                                               SYSCALL STOP");
+			if (so.gp != null && so.gp.running != null) {
+				so.gp.running.estado = EstadoProc.TERMINATED;
+			}
 		}
 
 		public void handle() {
-			System.out.println("SYSCALL pars:  " + hw.cpu.reg[8] + " / " + hw.cpu.reg[9]);
+			int a = hw.cpu.getRegs()[8];
+			int b = hw.cpu.getRegs()[9];
+			System.out.println("SYSCALL pars:  " + a + " / " + b);
 		
-			if (hw.cpu.reg[8] == 2) {                   // OUT
+			if (a == 2) { // OUT
 				try {
-					Word w = so.mmu.read(so.gp.running, hw.cpu.reg[9]); // endereço lógico
+					Word w = so.mmu.read(so.gp.running, b); // endereço lógico
 					System.out.println("OUT:   " + w.p);
 				} catch (Exception e) {
 					System.out.println("OUT: endereco invalido");
 				}
-			} else if (hw.cpu.reg[8] == 1) {
-				// IN (se for implementar): ler do console e gravar via so.mmu.writeData(so.gp.running, reg[9], valor)
+			} else if (a == 1) {
+				// IN (se for implementar)
 			} else {
 				System.out.println("  PARAMETRO INVALIDO");
 			}
 		}
 		
+
 		
 	}
 
@@ -917,24 +1003,30 @@ public class Sistema {
 		};
 	}
 	public class GerenteProcessos {
+		// --- dependências do SO/HW ---
 		private final HW hw;
 		private final SO so;
 		private final GerenteMemoria gm;
 		private final MMU mmu;
 	
+		// --- estruturas do GP ---
 		private int nextPid = 1;
-		public PCB running = null;
-		private Map<Integer, PCB> tabela = new HashMap<>();
-		private Deque<PCB> ready = new ArrayDeque<>();
+		public  PCB running = null;                 // visível ao SysCall (OUT usa so.gp.running)
+		private final Map<Integer, PCB> tabela = new HashMap<>();
+		private final Deque<PCB> ready = new ArrayDeque<>();
+	
+		// --- parâmetros do escalonador ---
+		private int quantum = 8;                    // nº de instruções por fatia (ajuste à vontade)
 	
 		public GerenteProcessos(HW hw, SO so, GerenteMemoria gm, MMU mmu) {
 			this.hw = hw; this.so = so; this.gm = gm; this.mmu = mmu;
 		}
-
-		public void frames() {
-			gm.printFrames();
-		}
-		
+	
+		// ------------------------------------------------------------
+		// utilitários de inspeção (opcionais, mas úteis p/ teste)
+		// ------------------------------------------------------------
+		public void frames() { gm.printFrames(); }
+	
 		public void map(int pid) {
 			PCB pcb = tabela.get(pid);
 			if (pcb == null) { System.out.println("PID inexistente"); return; }
@@ -942,19 +1034,21 @@ public class Sistema {
 			System.out.println("Mapeamento LOG -> FIS (pid="+pid+", tamPg="+tamPg+"):");
 			for (int log = 0; log < pcb.tamLogico; log++) {
 				try {
-					int fis = mmu.traduz(pcb, log);
-					int page = log / tamPg;
-					int off  = log % tamPg;
+					int fis   = mmu.traduz(pcb, log);
+					int page  = log / tamPg;
+					int off   = log % tamPg;
 					int frame = pcb.tabelaPaginas[page];
 					System.out.printf("L=%-3d  (pag=%-2d off=%-2d)  ->  FIS=%-4d  (frame=%-3d)%n",
-									   log, page, off, fis, frame);
+									  log, page, off, fis, frame);
 				} catch (Exception e) {
 					System.out.printf("L=%-3d  <endereco invalido>%n", log);
 				}
 			}
-		}		
+		}
 	
-		// new <programa>
+		// ------------------------------------------------------------
+		// criação / remoção / listagem
+		// ------------------------------------------------------------
 		public Integer criaProcesso(String nomeProg) {
 			Word[] image = progs.retrieveProgram(nomeProg);
 			if (image == null) { System.out.println("Programa nao encontrado: " + nomeProg); return null; }
@@ -966,7 +1060,7 @@ public class Sistema {
 			int pid = nextPid++;
 			PCB pcb = new PCB(pid, nomeProg, tp, tam);
 	
-			// carga paginada
+			// carga paginada (lógico -> físico via MMU)
 			for (int i = 0; i < tam; i++) {
 				try { mmu.writeWord(pcb, i, image[i]); }
 				catch (Exception e) { throw new RuntimeException("Falha carga: "+e.getMessage()); }
@@ -979,11 +1073,10 @@ public class Sistema {
 			return pid;
 		}
 	
-		// rm <id>
 		public boolean desalocaProcesso(int pid) {
 			PCB pcb = tabela.get(pid);
 			if (pcb == null) { System.out.println("PID inexistente: " + pid); return false; }
-			if (running == pcb) { running = null; } // simples: se estivesse rodando, 'derruba'
+			if (running == pcb) { running = null; } // se estivesse rodando, derruba
 			ready.remove(pcb);
 			gm.desaloca(pcb.tabelaPaginas);
 			tabela.remove(pid);
@@ -991,33 +1084,36 @@ public class Sistema {
 			return true;
 		}
 	
-		// ps
 		public void ps() {
-			System.out.println("PID  ESTADO      NOME      PC  TAM  PAGs");
+			System.out.println("PID  ESTADO       NOME        PC  TAM  PAGs");
 			for (PCB pcb : tabela.values()) {
-				System.out.printf("%-4d %-11s %-9s %-3d %-4d %-4d%n",
-					pcb.pid, pcb.estado, pcb.nome, pcb.pc, pcb.tamLogico, pcb.tabelaPaginas.length);
+				System.out.printf("%-4d %-12s %-10s %-3d %-4d %-4d%n",
+								  pcb.pid, pcb.estado, pcb.nome, pcb.pc, pcb.tamLogico, pcb.tabelaPaginas.length);
 			}
-
 			if (running != null) {
 				System.out.println("RUNNING: pid=" + running.pid + " ("+running.nome+")");
 			}
 		}
 	
-		// dump <id>
 		public void dumpPCB(int pid) {
 			PCB pcb = tabela.get(pid);
 			if (pcb == null) { System.out.println("PID inexistente"); return; }
+	
 			System.out.println("=== PCB pid="+pcb.pid+" nome="+pcb.nome+" estado="+pcb.estado+" pc="+pcb.pc);
-			
-			// NOVO: tabela de páginas
 			System.out.print("Tabela de páginas (page -> frame): ");
 			for (int i = 0; i < pcb.tabelaPaginas.length; i++) {
 				System.out.print(i + "->" + pcb.tabelaPaginas[i] + (i+1<pcb.tabelaPaginas.length ? ", " : ""));
 			}
 			System.out.println();
-		
-			// dump lógico do programa (já existia)
+	
+			// registradores salvos (Parte C)
+			System.out.print("Regs: ");
+			for (int i = 0; i < pcb.regs.length; i++) {
+				System.out.print("r"+i+"="+pcb.regs[i] + (i+1<pcb.regs.length ? " " : ""));
+			}
+			System.out.println();
+	
+			// dump lógico do programa
 			for (int i = 0; i < pcb.tamLogico; i++) {
 				try {
 					Word w = mmu.read(pcb, i);
@@ -1025,33 +1121,89 @@ public class Sistema {
 				} catch (Exception e) { System.out.println(i + ": <invalid>"); }
 			}
 		}
-		
 	
-		// exec <id>
+		// memória física (dumpM)
+		public void dumpMem(int ini, int fim) { so.utils.dump(ini, fim); }
+	
+		// trace
+		public void setTrace(boolean on) { hw.cpu.setDebug(on); }
+	
+		// quantum
+		public void setQuantum(int q) { this.quantum = Math.max(1, q); }
+	
+		// ------------------------------------------------------------
+		// Execução (Parte C): Round-Robin com fatias de tempo
+		// ------------------------------------------------------------
+	
+		// compatibilidade com o comando "exec <pid>":
+		// - coloca o pid escolhido na frente da fila e roda RR.
 		public boolean exec(int pid) {
-			PCB pcb = tabela.get(pid);
-			if (pcb == null) { System.out.println("PID inexistente"); return false; }
-			running = pcb;
-			pcb.estado = EstadoProc.RUNNING;
-			so.mmu = mmu;                 // para SysCall
-			so.gp = this;                 // para SysCall achar running
-			// seta contexto
-			hw.cpu.setContext(pcb.pc, pcb);
-			// roda (modo cooperativo; STOP/interrupt finaliza cpu.run)
-			hw.cpu.run();
-			// atualiza estado
-			pcb.estado = EstadoProc.READY;  // mantemos pronto após execução (pode executar de novo)
-			pcb.pc = 0;                     // como o programa terminou, pc volta a 0 (padrão simples)
-			running = null;
+			PCB alvo = tabela.get(pid);
+			if (alvo == null) { System.out.println("PID inexistente"); return false; }
+			if (!ready.remove(alvo) && alvo.estado != EstadoProc.READY) {
+				// se não estava na fila READY, (re)insere
+			}
+			// garante que está em READY e vai ser o próximo
+			alvo.estado = EstadoProc.READY;
+			ready.addFirst(alvo);
+	
+			// executa RR até esvaziar a fila
+			scheduleRR();
 			return true;
 		}
 	
-		// dumpM <ini,fim> físico (já existia em Utilities, reaproveite se preferir)
-		public void dumpMem(int ini, int fim) { so.utils.dump(ini, fim); }
+		// loop principal do escalonador RR
+		private void scheduleRR() {
+			while (!ready.isEmpty()) {
+				PCB pcb = ready.pollFirst();
+				running = pcb;
+				pcb.estado = EstadoProc.RUNNING;
 	
-		// traceOn/Off
-		public void setTrace(boolean on) { hw.cpu.setDebug(on); }
-	}
+				// disponibiliza referências p/ SysCall (OUT) e CPU
+				so.mmu = mmu;
+				so.gp  = this;
+	
+				// executa uma fatia
+				Interrupts motivo = hw.cpu.runSlice(quantum, pcb);
+	
+				// decide pós-execução
+				switch (motivo) {
+					case noInterrupt:  // terminou por STOP
+						finalizarProcessoOk(pcb);
+						break;
+	
+					case intClock:     // tempo esgotado -> volta para READY
+						pcb.estado = EstadoProc.READY;
+						ready.addLast(pcb);
+						break;
+	
+					case intEnderecoInvalido:
+					case intInstrucaoInvalida:
+					case intOverflow:
+					default:           // qualquer erro -> mata processo
+						System.out.println("Processo " + pcb.pid + " encerrado por " + motivo);
+						matarProcesso(pcb);
+						break;
+				}
+	
+				running = null;
+			}
+		}
+	
+		private void finalizarProcessoOk(PCB pcb) {
+			pcb.estado = EstadoProc.TERMINATED;
+			// desaloca memória e remove da tabela
+			gm.desaloca(pcb.tabelaPaginas);
+			tabela.remove(pcb.pid);
+			System.out.println("Processo " + pcb.pid + " terminou (STOP). Memória liberada.");
+		}
+	
+		private void matarProcesso(PCB pcb) {
+			pcb.estado = EstadoProc.TERMINATED;
+			gm.desaloca(pcb.tabelaPaginas);
+			tabela.remove(pcb.pid);
+		}
+	}	
 	
 
 	// Dentro de Sistema (nível similar a HW/SO), crie:
@@ -1112,9 +1264,12 @@ public class Sistema {
 		public String nome;
 		public int[] tabelaPaginas;
 		public int tamLogico;
-		public int pc;                // PC lógico (salvamos aqui se fosse preemptivo; aqui serve p/ debug)
+		public int pc;                 // PC lógico
 		public EstadoProc estado;
-
+	
+		// --- NOVO: snapshot de registradores para preempção ---
+		public int[] regs = new int[10];
+	
 		public PCB(int pid, String nome, int[] tp, int tamLogico) {
 			this.pid = pid;
 			this.nome = nome;
@@ -1122,8 +1277,11 @@ public class Sistema {
 			this.tamLogico = tamLogico;
 			this.pc = 0;
 			this.estado = EstadoProc.READY;
+			// opcional: zera os registradores
+			for (int i = 0; i < regs.length; i++) regs[i] = 0;
 		}
 	}
+	
 
 	
 		// Ainda em Sistema:
