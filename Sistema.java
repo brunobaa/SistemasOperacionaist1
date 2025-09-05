@@ -608,6 +608,8 @@ public class Sistema {
 		// disponibiliza para SysCall e GP
 		so.mmu = mmu;
 		so.gp  = new GerenteProcessos(hw, so, gm, mmu);
+		//new Thread(() -> so.gp.loopContinuo(), "Scheduler").start();
+
 	}
 	
 	
@@ -637,6 +639,18 @@ public class Sistema {
 					case "frames":
 						so.gp.frames();
 						break;
+					
+					case "quantum":
+						if (tok.length < 2) { System.out.println("uso: quantum <n>"); break; }
+						so.gp.setQuantum(Integer.parseInt(tok[1]));
+						System.out.println("quantum = " + Integer.parseInt(tok[1]));
+						break;
+					
+					
+					case "execall":
+						so.gp.execAll();
+						break;
+					
 					
 					case "rm":
 						if (tok.length < 2) { System.out.println("uso: rm <pid>"); break; }
@@ -1008,12 +1022,16 @@ public class Sistema {
 		private final SO so;
 		private final GerenteMemoria gm;
 		private final MMU mmu;
+
 	
 		// --- estruturas do GP ---
 		private int nextPid = 1;
-		public  PCB running = null;                 // visível ao SysCall (OUT usa so.gp.running)
-		private final Map<Integer, PCB> tabela = new HashMap<>();
-		private final Deque<PCB> ready = new ArrayDeque<>();
+		public volatile PCB running = null;                 // visível ao SysCall (OUT usa so.gp.running)
+
+		// depois
+		private final Map<Integer, PCB> tabela = new java.util.concurrent.ConcurrentHashMap<>();
+		private final Deque<PCB> ready = new java.util.concurrent.ConcurrentLinkedDeque<>();
+
 	
 		// --- parâmetros do escalonador ---
 		private int quantum = 8;                    // nº de instruções por fatia (ajuste à vontade)
@@ -1026,6 +1044,68 @@ public class Sistema {
 		// utilitários de inspeção (opcionais, mas úteis p/ teste)
 		// ------------------------------------------------------------
 		public void frames() { gm.printFrames(); }
+
+		public void execAll() {
+			//System.out.println("Escalonador contínuo ativo. Processos prontos: " + ready.size());
+			// O loopContinuo já executa todo mundo.
+			scheduleRR(); // roda Round-Robin até esvaziar a fila READY
+		}
+		
+		public boolean exec(int pid) {
+			PCB alvo = tabela.get(pid);
+			if (alvo == null) { System.out.println("PID inexistente"); return false; }
+			// Reposiciona na frente da fila para ser o próximo a rodar
+			ready.remove(alvo);        // ok se não estiver na fila
+			alvo.estado = EstadoProc.READY;
+			ready.addFirst(alvo);
+			return true;
+		}
+		
+		
+		// no GerenteProcessos
+		private volatile boolean ativo = true;
+
+		public void loopContinuo() {
+			while (ativo) {
+				PCB pcb = ready.pollFirst();   // thread-safe
+				if (pcb == null) {
+					try { Thread.sleep(5); } catch (InterruptedException ignored) {}
+					continue;
+				}
+
+				running = pcb;
+				pcb.estado = EstadoProc.RUNNING;
+
+				Interrupts motivo = hw.cpu.runSlice(quantum, pcb);
+
+				if (motivo == Interrupts.noInterrupt) {
+					// terminou por STOP normalmente
+					finalizarProcessoOk(pcb);
+				} else if (pcb.killed) {
+					// usuário pediu rm enquanto rodava: mata agora, sem re-enfileirar
+					System.out.println("Processo " + pcb.pid + " finalizado por rm ao fim da fatia.");
+					matarProcesso(pcb);
+				} else {
+					switch (motivo) {
+						case intClock:     // tempo esgotado -> volta para READY
+							pcb.estado = EstadoProc.READY;
+							ready.addLast(pcb);
+							break;
+						case intEnderecoInvalido:
+						case intInstrucaoInvalida:
+						case intOverflow:
+						default:           // qualquer erro -> mata processo
+							System.out.println("Processo " + pcb.pid + " encerrado por " + motivo);
+							matarProcesso(pcb);
+							break;
+					}
+				}				
+
+				running = null;
+			}
+		}
+
+
 	
 		public void map(int pid) {
 			PCB pcb = tabela.get(pid);
@@ -1052,49 +1132,57 @@ public class Sistema {
 		public Integer criaProcesso(String nomeProg) {
 			Word[] image = progs.retrieveProgram(nomeProg);
 			if (image == null) { System.out.println("Programa nao encontrado: " + nomeProg); return null; }
+		
 			int tam = image.length;
-	
 			int[] tp = gm.aloca(tam);
 			if (tp == null) { System.out.println("Sem memoria para " + nomeProg); return null; }
-	
+		
 			int pid = nextPid++;
 			PCB pcb = new PCB(pid, nomeProg, tp, tam);
-	
-			// carga paginada (lógico -> físico via MMU)
+		
 			for (int i = 0; i < tam; i++) {
 				try { mmu.writeWord(pcb, i, image[i]); }
 				catch (Exception e) { throw new RuntimeException("Falha carga: "+e.getMessage()); }
 			}
-	
-			tabela.put(pid, pcb);
-			ready.addLast(pcb);
+		
+			tabela.put(pid, pcb);      // thread-safe
+			ready.addLast(pcb);        // thread-safe
 			pcb.estado = EstadoProc.READY;
 			System.out.println("Processo criado: pid=" + pid + " nome=" + nomeProg);
 			return pid;
 		}
-	
+		
 		public boolean desalocaProcesso(int pid) {
 			PCB pcb = tabela.get(pid);
 			if (pcb == null) { System.out.println("PID inexistente: " + pid); return false; }
-			if (running == pcb) { running = null; } // se estivesse rodando, derruba
+		
+			// se estiver rodando, não libere memória agora — marque para matar no fim da fatia
+			if (running == pcb) {
+				pcb.killed = true;  // <--- marca para remoção
+				System.out.println("Processo " + pid + " marcado para remoção ao fim da fatia (rm durante RUNNING).");
+				return true;
+			}
+		
+			// se não está rodando, remova de READY (se estiver) e desaloca agora
 			ready.remove(pcb);
 			gm.desaloca(pcb.tabelaPaginas);
 			tabela.remove(pid);
 			System.out.println("Processo removido: " + pid);
 			return true;
 		}
-	
+		
+		
 		public void ps() {
 			System.out.println("PID  ESTADO       NOME        PC  TAM  PAGs");
 			for (PCB pcb : tabela.values()) {
 				System.out.printf("%-4d %-12s %-10s %-3d %-4d %-4d%n",
-								  pcb.pid, pcb.estado, pcb.nome, pcb.pc, pcb.tamLogico, pcb.tabelaPaginas.length);
+						pcb.pid, pcb.estado, pcb.nome, pcb.pc, pcb.tamLogico, pcb.tabelaPaginas.length);
 			}
 			if (running != null) {
 				System.out.println("RUNNING: pid=" + running.pid + " ("+running.nome+")");
 			}
 		}
-	
+		
 		public void dumpPCB(int pid) {
 			PCB pcb = tabela.get(pid);
 			if (pcb == null) { System.out.println("PID inexistente"); return; }
@@ -1134,23 +1222,6 @@ public class Sistema {
 		// ------------------------------------------------------------
 		// Execução (Parte C): Round-Robin com fatias de tempo
 		// ------------------------------------------------------------
-	
-		// compatibilidade com o comando "exec <pid>":
-		// - coloca o pid escolhido na frente da fila e roda RR.
-		public boolean exec(int pid) {
-			PCB alvo = tabela.get(pid);
-			if (alvo == null) { System.out.println("PID inexistente"); return false; }
-			if (!ready.remove(alvo) && alvo.estado != EstadoProc.READY) {
-				// se não estava na fila READY, (re)insere
-			}
-			// garante que está em READY e vai ser o próximo
-			alvo.estado = EstadoProc.READY;
-			ready.addFirst(alvo);
-	
-			// executa RR até esvaziar a fila
-			scheduleRR();
-			return true;
-		}
 	
 		// loop principal do escalonador RR
 		private void scheduleRR() {
@@ -1269,6 +1340,7 @@ public class Sistema {
 	
 		// --- NOVO: snapshot de registradores para preempção ---
 		public int[] regs = new int[10];
+    	public volatile boolean killed = false; 
 	
 		public PCB(int pid, String nome, int[] tp, int tamLogico) {
 			this.pid = pid;
